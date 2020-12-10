@@ -6,7 +6,8 @@
 const EventEmitter = require('events');
 
 function use(defaultOptions) {
-  defaultOptions.parallel = defaultOptions.parallel || 1;
+  // Never change objects that you do not own. If uncomment next line option parallel always will be 1
+  // defaultOptions.parallel = defaultOptions.parallel || 1;
   const bus = new EventEmitter();
   let isFilling = false;
   const awaiting = [];
@@ -40,19 +41,36 @@ function use(defaultOptions) {
     const {
       getKey, getCondition, foreignField, baseCondition, defaultValue, targetField, getAddingMethod, useTargetId
     } = options;
-    options.extractKey = options.extractKey || (foreign => foreign[foreignField]);
+    if (options.extractKey) {
+      if ('function' !== typeof options.extractKey) {
+        throw new Error('extractKey key is not a function');
+      }
+    } else {
+      // In case if foreignField is undefined avoid extract 'undefined' key from foreign object
+      if ('string' !== typeof foreignField) {
+        throw new Error('foreignField is required');
+      }
+      options.extractKey = foreign => foreign[foreignField];
+    }
+    if ('string' !== typeof targetField) {
+      throw new Error('targetField must be a string');
+    }
     const targets = {};
     const condition = baseCondition || {};
     const inner = [];
     let isConditionSetup = false;
-    const additions = {useTargetId};
+    const additions = { useTargetId: !!useTargetId };
     awaiting.push({ source, targetField, options, targets, condition, additions });
 
-    return {
-      add: getAddingMethod({
-        targets, getKey, getCondition, defaultValue, targetField, condition, foreignField, inner, isConditionSetup, additions,
-      }),
-    };
+    const add = getAddingMethod({
+      targets, getKey, getCondition, defaultValue, targetField, condition, foreignField, inner, isConditionSetup, additions,
+    });
+
+    if ('function' !== typeof add) {
+      throw new Error('getAddingMethod must return a function');
+    }
+
+    return { add };
   }
 
   /**
@@ -62,19 +80,33 @@ function use(defaultOptions) {
    * @returns {Promise}
    */
   async function fillSubscriptions() {
-    if (isFilling) await new Promise(resolve => bus.once('released', resolve));
+    if (0 === awaiting.length) {
+      return [];
+    }
+    if (isFilling) {
+      await new Promise(resolve => bus.once('released', resolve));
+    }
 
     isFilling = true;
     const promises = awaiting
-      .map(({ source, targetField, options: {
-          extractKey, sourceField, getStream, isMultiple, useEachAsync, getDataHandler, parallel, assignData
-        }, targets, condition, additions }) => useEachAsync ?
-        getStream(source, condition).eachAsync(getDataHandler({ targets, extractKey, isMultiple, targetField, sourceField, assignData, additions }),
-          { parallel }) :
-        new Promise((resolve, reject) => getStream(source, condition)
-          .on('data', getDataHandler({ targets, extractKey, isMultiple, targetField, sourceField, assignData, additions }))
-          .on('error', reject)
-          .on('end', resolve)));
+      .map((awaitingOptions) => {
+        const {
+          source, targetField, targets, condition, additions,
+          options: {
+            extractKey, sourceField, getStream, isMultiple, useEachAsync, getDataHandler, parallel, assignData
+          },
+        } = awaitingOptions;
+        const handle = getDataHandler({ targets, extractKey, isMultiple, targetField, sourceField, assignData, additions });
+        if (useEachAsync) {
+          return getStream(source, condition).eachAsync(handle, { parallel: 'number' === typeof parallel ? parallel : 1 });
+        }
+        return new Promise(
+          (resolve, reject) => getStream(source, condition)
+            .on('data', handle)
+            .on('error', reject)
+            .on('end', resolve)
+        );
+      });
     awaiting.splice(0, awaiting.length);
     isFilling = false;
     bus.emit('released');
